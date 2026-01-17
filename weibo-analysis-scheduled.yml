@@ -1,0 +1,219 @@
+name: Weibo Analysis - Scheduled (Beijing Time 6AM & 6PM)
+
+on:
+  schedule:
+    # 北京时间早上6点 = UTC 22点（前一天）
+    - cron: "0 22 * * *"
+    # 北京时间晚上6点 = UTC 10点
+    - cron: "0 10 * * *"
+  workflow_dispatch:  # 允许手动触发
+
+permissions:
+  contents: write  # 需要写权限以便提交报告
+
+jobs:
+  weibo-hotspot-analysis:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python environment
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: 'pip'
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install claude-agent-sdk anthropic anyio httpx requests
+
+      - name: Create resources directory
+        run: |
+          mkdir -p resources
+          echo "Resources directory created"
+
+      - name: Stage 1 - Fetch Weibo Hotspots
+        env:
+          TIANAPI_WEIBO_API_KEY: ${{ secrets.TIANAPI_WEIBO_API_KEY }}
+        run: |
+          echo "=== 阶段1: 抓取微博热搜数据 ==="
+          curl -G "https://apis.tianapi.com/weibohot/index" \
+            --data-urlencode "key=$TIANAPI_WEIBO_API_KEY" \
+            -o resources/weibo_hotspots_raw.json
+
+          # 验证数据是否成功获取
+          if [ -f resources/weibo_hotspots_raw.json ]; then
+            echo "✅ 热搜数据抓取成功"
+            # 显示数据基本信息
+            python -c "import json; data=json.load(open('resources/weibo_hotspots_raw.json')); print(f'数据条数: {len(data.get(\"result\", {}).get(\"list\", []))}条')"
+          else
+            echo "❌ 热搜数据抓取失败"
+            exit 1
+          fi
+
+      - name: Stage 1 - Parse and format data
+        run: |
+          echo "=== 解析和格式化数据 ==="
+          python scripts/parse_hotspots.py
+          python scripts/data_quality_check.py
+          python scripts/get_top10.py
+
+      - name: Stage 2 & 3 - Background Collection and Creative Analysis
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          TIAN_API_KEY: ${{ secrets.TIANAPI_WEIBO_API_KEY }}
+        run: |
+          echo "=== 阶段2: 背景信息采集 ==="
+          echo "=== 阶段3: AI创意分析 ==="
+          python scripts/ai_creative_analysis.py
+
+      - name: Stage 3 - Creative Quality Report
+        run: |
+          echo "=== 生成创意质量报告 ==="
+          python scripts/creative_quality_report.py
+
+      - name: Stage 4 - Generate HTML Report
+        run: |
+          echo "=== 阶段4: 生成HTML报告 ==="
+          python scripts/generate_html_report.py
+
+          # 验证HTML报告是否生成
+          if ls resources/微博热搜分析-*.html 1> /dev/null 2>&1; then
+            echo "✅ HTML报告生成成功"
+            ls -lh resources/微博热搜分析-*.html
+          else
+            echo "❌ HTML报告生成失败"
+            exit 1
+          fi
+
+      - name: Generate Summary with Claude Agent SDK
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          echo "=== 使用 Claude Agent SDK 生成总结 ==="
+          python - << "PYTHON_SCRIPT"
+          import json
+          from datetime import datetime
+          import anyio
+          from claude_agent_sdk import query
+
+          # 读取分析结果
+          with open("resources/creative_analysis_results.json", "r", encoding="utf-8") as f:
+              data = json.load(f)
+
+          results = data.get("results", [])
+          hot_count = len(results)
+
+          # 统计评分分布
+          excellent = sum(1 for r in results if r['scoring']['total_score'] >= 80)
+          good = sum(1 for r in results if 60 <= r['scoring']['total_score'] < 80)
+          normal = sum(1 for r in results if r['scoring']['total_score'] < 60)
+
+          # 找出得分最高的3个话题
+          top_3 = sorted(results, key=lambda x: x['scoring']['total_score'], reverse=True)[:3]
+
+          today = datetime.now().strftime("%Y年%m月%d日")
+
+          prompt = f"""今天是{today}，我完成了微博热搜产品创意分析。
+
+  分析结果摘要：
+  - 共分析了 {hot_count} 条热搜
+  - 评分分布：优秀({excellent}个)、良好({good}个)、一般({normal}个)
+  - TOP 3 话题：
+    1. {top_3[0]['title']} (得分: {top_3[0]['scoring']['total_score']:.1f})
+    2. {top_3[1]['title']} (得分: {top_3[1]['scoring']['total_score']:.1f})
+    3. {top_3[2]['title']} (得分: {top_3[2]['scoring']['total_score']:.1f})
+
+  请用中文生成一段不超过300字的分析总结，重点说明：
+  1. 今日热搜的整体特点和趋势
+  2. 最值得关注的话题及其产品创意价值
+  3. 评分分布反映的市场机会
+
+  以JSON部分内容为参考：
+  {json.dumps(top_3, ensure_ascii=False, indent=2)[:8000]}
+  """
+
+          async def generate_summary():
+              print("正在调用 Claude Agent SDK 生成总结...")
+              summary = ""
+              async for chunk in query(prompt=prompt):
+                  summary += chunk
+
+              print("\n=== Claude AI 分析总结 ===")
+              print(summary)
+              print("=" * 60)
+
+              # 保存总结到文件
+              with open("resources/analysis_summary.txt", "w", encoding="utf-8") as f:
+                  f.write(f"微博热搜产品创意分析总结 - {today}\n")
+                  f.write("=" * 60 + "\n\n")
+                  f.write(summary)
+
+              print("✅ 分析总结已保存到 resources/analysis_summary.txt")
+
+          anyio.run(generate_summary)
+          PYTHON_SCRIPT
+
+      - name: Upload HTML report as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: weibo-hotspot-report-${{ github.run_number }}
+          path: |
+            resources/微博热搜分析-*.html
+            resources/analysis_summary.txt
+            resources/creative_analysis_results.json
+          retention-days: 30
+
+      - name: Commit and push results (optional)
+        if: github.event_name == 'schedule'
+        run: |
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "GitHub Actions Bot"
+
+          # 添加生成的文件
+          git add resources/微博热搜分析-*.html
+          git add resources/analysis_summary.txt
+          git add resources/*.json
+
+          # 提交（如果有变更）
+          if git diff --staged --quiet; then
+            echo "没有新的变更需要提交"
+          else
+            TIMESTAMP=$(date -u +"%Y-%m-%d %H:%M UTC")
+            git commit -m "chore: 微博热搜分析报告 - $TIMESTAMP [skip ci]"
+            git push
+            echo "✅ 分析结果已提交到仓库"
+          fi
+
+      - name: Job Summary
+        if: always()
+        run: |
+          echo "## 微博热搜分析执行摘要 📊" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**执行时间:** $(date -u +"%Y-%m-%d %H:%M:%S UTC") (北京时间: $(TZ=Asia/Shanghai date +"%Y-%m-%d %H:%M:%S"))" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          if [ -f resources/creative_analysis_results.json ]; then
+            echo "### 分析统计" >> $GITHUB_STEP_SUMMARY
+            python - << "SUMMARY_SCRIPT"
+          import json
+          results = json.load(open('resources/creative_analysis_results.json'))['results']
+          excellent = sum(1 for r in results if r['scoring']['total_score'] >= 80)
+          good = sum(1 for r in results if 60 <= r['scoring']['total_score'] < 80)
+          normal = sum(1 for r in results if r['scoring']['total_score'] < 60)
+          print(f"- 📈 总分析数: {len(results)} 条热搜")
+          print(f"- ⭐ 优秀 (≥80分): {excellent} 个")
+          print(f"- ✓ 良好 (60-80分): {good} 个")
+          print(f"- ⚪ 一般 (<60分): {normal} 个")
+          SUMMARY_SCRIPT
+            echo "" >> $GITHUB_STEP_SUMMARY
+
+            if [ -f resources/analysis_summary.txt ]; then
+              echo "### Claude AI 分析总结" >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+              tail -n +3 resources/analysis_summary.txt >> $GITHUB_STEP_SUMMARY
+            fi
+          fi
